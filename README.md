@@ -3,48 +3,59 @@
 [![PyPI version](https://img.shields.io/pypi/v/dalga.svg)](https://pypi.org/project/dalga/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A blazing-fast, $O(1)$ memory streaming data profiler. Written in Rust, built for Python. 
+A blazing-fast, O(1) memory streaming data profiler. Written in Rust, built for Python.
 
-Dalga acts as an in-stream observability layer. It sits perfectly inside your existing data pipelines (Kafka, FastAPI, Pandas) and calculates statistical sketches of your data in real-time. It intercepts silent data corruption before it reaches your data warehouse, without adding latency to your workers.
+Dalga acts as an **in-stream observability layer** and **circuit breaker**. It sits natively inside your existing data pipelines (Kafka, FastAPI, Pandas, Polars) and calculates statistical sketches of your data in real-time. It intercepts silent data corruption before it reaches your data warehouse, all without adding latency to your workers.
 
 ## Why Dalga?
 
-* **Zero Compute Cost:** Stop querying 5TB BigQuery tables just to find a null rate. Dalga profiles the data *before* it hits the warehouse.
-* **$O(1)$ Memory Bound:** Uses 14-bit HyperLogLog+ algorithms to estimate cardinality. Whether you process 100 rows or 10 billion, Dalga uses exactly ~16KB of memory per column.
-* **Non-Blocking & Safe:** Designed to "fail-open." If the telemetry fails, your pipeline keeps running.
-* **Framework Agnostic:** Explicit adapters for Pandas, FastAPI, and `confluent-kafka`.
+* **Zero Compute Cost:** Stop querying multi-terabyte warehouse tables just to monitor null rates or cardinality. Dalga profiles the data *before* it lands.
+* **Lock-Free Concurrency:** Built on a double-buffered `ArcSwap` and atomic counters. Multiple threads can hammer the engine simultaneously with zero lock contention.
+* **Bounded O(1) Memory:** Utilizes 14-bit `HyperLogLogPlus` algorithms to estimate cardinality. Whether you process 100 rows or 10 billion, Dalga uses exactly ~16KB of memory per column.
+* **Fail-Open & Safe:** Designed for mission-critical pipelines. If the telemetry fails, or if it encounters malformed bytes, Dalga gracefully drops the bad data and keeps your pipeline running.
+* **Framework Agnostic:** First-class adapters for Pandas, Polars, FastAPI, and `confluent-kafka`.
+
+---
 
 ## Installation
 
-You can install Dalga using `uv`, `pip`, or any standard package manager:
+Dalga is available on PyPI. You can install it using `uv`, `pip`, or your preferred package manager:
 
 ```bash
 uv add dalga-core
 # or
 pip install dalga-core
-
 ```
+
+*(Note: The package name is `dalga-core`, but the import namespace is `dalga`)*
+
+---
 
 ## Quickstart
 
-Dalga processes data locally and prints a beautiful terminal dashboard. (Optional: Pass an API key to send metadata to `api.dalga.dev` for historical tracking and alerting).
+Dalga processes data locally in an isolated Rust memory space. It automatically flushes metadata payloads in the background without blocking your host application.
 
-### 1. The Core Engine (Standard Python)
+### 1. The Core Engine (Batch Processing)
 
-If you just have lists of dictionaries or JSON payloads, use the universal `.flow()` method.
+For standard lists of dictionaries or JSON payloads, use the universal `.flow()` method. The Rust engine natively processes batches for maximum throughput.
 
 ```python
 from dalga.core import DalgaClient
 
 dalga = DalgaClient()
 
-data = [{"user_id": 1, "status": "active"}, {"user_id": 2, "status": "banned"}]
-dalga.flow(data)
+# Pass batches directly to bypass Python iteration overhead
+batch_data = [
+    {"user_id": 1, "status": "active"}, 
+    {"user_id": 2, "status": "banned"}
+]
+dalga.flow(batch_data)
 
 ```
-### 🛡️ The Circuit Breaker (Data Quality Gates)
 
-Dalga doesn't just monitor data; it actively protects your database from silent corruption. You can evaluate batches of data in isolated memory using the `Expectation` API. If a batch fails your rules, Dalga rejects it before it pollutes your global state or your data warehouse.
+### 2. The Circuit Breaker (Data Quality Gates)
+
+Dalga actively protects your database from silent corruption. Evaluate incoming batches against strict `Expectation` rules. If a batch violates the rules, Dalga rejects it before it pollutes your global state or warehouse.
 
 ```python
 from dalga.core import DalgaClient, Expectation
@@ -59,38 +70,61 @@ rules = [
 
 batch = fetch_kafka_messages()
 
+# Evaluates the batch in an isolated Rust memory space
 if dalga.validate(batch, rules):
     insert_to_snowflake(batch)
 else:
     send_to_dead_letter_queue(batch)
+
 ```
 
-### 2. The Kafka Adapter
+### 3. The Kafka Adapter
 
-Sit inside the consumer loop and profile high-throughput streams natively.
+Drop Dalga directly into your consumer `poll()` loop to profile high-throughput streams natively.
 
 ```python
 from dalga.core import DalgaClient
 from dalga.adapters.kafka import DalgaKafka
 
-dalga = DalgaClient()
+dalga = DalgaClient(max_records=10_000)
 kafka_adapter = DalgaKafka(dalga)
 
 while True:
-    messages = consumer.consume(num_messages=500, timeout=1.0)
+    messages = consumer.consume(num_messages=2000, timeout=1.0)
     if not messages:
         continue
-        
-    # Parses the raw bytes and profiles the batch instantly in Rust
-    kafka_adapter.profile_batch(messages)
-    
-    # ... your normal DB insertion logic ...
 
+    # Parses raw bytes and profiles the entire micro-batch instantly in Rust
+    kafka_adapter.profile_batch(messages)
+
+    # ... your normal DB insertion logic ...
 ```
 
-### 3. The FastAPI Middleware
+### 4. DataFrames (Pandas & Polars)
 
-Monitor the shape of incoming JSON payloads without blocking the event loop.
+Monitor batch transformations instantly. Importing the adapters automatically registers the `.dalga` namespace to your DataFrames.
+
+```python
+import pandas as pd
+import polars as pl
+from dalga.core import DalgaClient
+import dalga.adapters.pandas 
+import dalga.adapters.polars
+
+dalga = DalgaClient()
+
+# Pandas
+df_pd = pd.read_csv("daily_users.csv")
+df_pd.dalga.profile(dalga)
+
+# Polars
+df_pl = pl.read_parquet("daily_users.parquet")
+df_pl.dalga.profile(dalga)
+```
+
+### 5. The FastAPI Middleware
+
+Monitor the shape of incoming JSON payloads asynchronously without starving your endpoint streams.
 
 ```python
 from fastapi import FastAPI
@@ -100,35 +134,26 @@ from dalga.adapters.fastapi import DalgaMiddleware
 dalga = DalgaClient()
 app = FastAPI()
 
-# Monitor specific endpoints or all traffic
+# Profile specific endpoints (or all traffic) safely
 app.add_middleware(DalgaMiddleware, client=dalga, endpoints_to_monitor=["/ingest"])
 
+@app.post("/ingest")
+async def ingest_data(payload: dict):
+    return {"status": "success"}
 ```
 
-### 4. The Pandas / Polars Adapter
+---
 
-Monitor batch transformations instantly using the `.dalga` namespace.
+## Architecture (Under the Hood)
 
-```python
-import pandas as pd
-from dalga.core import DalgaClient
-import dalga.adapters.pandas 
+Dalga leverages [PyO3](https://github.com/PyO3/pyo3) to bridge Python directly to a highly optimized Rust engine.
 
-dalga = DalgaClient()
-df = pd.read_csv("daily_users.csv")
+1. **Zero-Copy Extraction:** Python dictionaries are evaluated at the FFI boundary, extracting types (Int, Float, Str, Null) without expensive string parsing allocations.
+2. **Lock-Free Aggregation:** The Rust core calculates Min, Max, and Nulls using atomic counters. Thread contention is virtually eliminated, even on extremely hot columns.
+3. **Double-Buffered Flushes:** Background flushes utilize `ArcSwap` to atomically swap the active `DashMap` in O(1) time. Ingestion threads never block waiting for serialization.
+4. **Absolute Memory Bounds:** Unique values are hashed into a `HyperLogLogPlus` sketch, ensuring memory utilization remains flat regardless of dataset size.
 
-# Profiles the dataframe and prints a local report
-df.dalga.profile(dalga)
-
-```
-
-## How it Works (Under the Hood)
-
-Dalga leverages [PyO3](https://github.com/PyO3/pyo3) and Rust to handle data ingestion.
-
-1. The Python adapters extract the batch data and pass it across the FFI boundary.
-2. The Rust core calculates Min, Max, Nulls, and uses a `HyperLogLogPlus` sketch to track unique values with absolute memory bounds.
-3. A background Python daemon thread flushes the lightweight metadata payload every 60 seconds (or when `max_records` is hit) using an `RLock` so your host application's threads are never blocked.
+---
 
 ## Local Development
 
@@ -138,10 +163,10 @@ Dalga uses `nix`, `uv`, and `maturin` for reproducible builds.
 # Enter the reproducible dev environment
 nix develop
 
-# Compile the Rust core and install into the local virtual environment
-uv run maturin develop
+# Sync dependencies and compile the Rust extension
+uv sync
+uv run maturin develop --release
 
 # Run the test suite
 uv run pytest tests/ -v
-
 ```
