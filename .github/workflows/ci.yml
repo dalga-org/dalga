@@ -1,0 +1,41 @@
+name: Dalga CI
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          
+      - name: Install uv
+        uses: astral-sh/setup-uv@v2
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          
+      - name: Install Dependencies
+        run: uv sync 
+        
+      - name: Lint Python
+        run: uv run ruff check .
+        
+      - name: Lint Rust
+        run: cargo clippy -- -D warnings
+        
+      - name: Build Rust Extension
+        run: uv run maturin develop --release
+        
+      - name: Run Tests
+        run: uv run pytest tests/ -v
